@@ -1,0 +1,289 @@
+#!/bin/bash
+# cc-launcher: a hidden Claude Code background session, reachable through Remote Control,
+# that opens iTerm2 tabs with cc-tab.
+#
+# A LaunchAgent runs `ensure` every 5 minutes. The background service can retire an idle
+# session (for example under memory pressure), so `ensure` starts it again, and it restarts a
+# session older than an hour while idle, for a clean context.
+#
+#   cc-launcher start    start the session and the 5-minute check
+#   cc-launcher stop     remove the check, stop the session, kill it if it does not stop
+#   cc-launcher status   show the check, the session and its Remote Control link
+#   cc-launcher ensure   start the session if it is gone; restart it if old and idle (LaunchAgent)
+#   cc-launcher restart  stop and start the session only
+#   cc-launcher whoami   print the Remote Control session id (run by the launcher session itself)
+
+set -uo pipefail
+
+CONFIG="$HOME/.config/cc-launcher/config"
+
+config_get() {
+  local key="$1" default="$2" line="" value=""
+  if [ -f "$CONFIG" ]; then
+    line="$(grep -E "^${key}=" "$CONFIG" | tail -1 || true)"
+    value="${line#*=}"
+  fi
+  value="${value/#\~/$HOME}"
+  printf '%s' "${value:-$default}"
+}
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELF="$BIN_DIR/cc-launcher"
+NAME="$(config_get SESSION_NAME "Launcher")"
+DIR="$(config_get LAUNCHER_DIR "$HOME/.claude/launcher")"
+LABEL="$(config_get LAUNCH_AGENT_LABEL "local.cc-launcher")"
+CLAUDE_BIN_DIR="$(config_get CLAUDE_BIN_DIR "$HOME/.local/bin")"
+LOG="$DIR/launcher.log"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+DOMAIN="gui/$(id -u)"
+STOP_WAIT_SECONDS=15
+START_WAIT_SECONDS=60
+CHECK_INTERVAL_SECONDS=300
+MAX_AGE_SECONDS=3600
+
+export PATH="$CLAUDE_BIN_DIR:/usr/bin:/bin:/usr/sbin:/sbin"
+
+log() {
+  printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"
+  printf '%s\n' "$*"
+}
+
+# Background sessions named $NAME that run in $DIR, one JSON object per line.
+# Pass --all to include stopped sessions.
+launcher_sessions() {
+  claude agents --json "$@" 2>/dev/null | jq -c --arg name "$NAME" --arg cwd "$DIR" \
+    '.[] | select(.kind == "background" and .name == $name and .cwd == $cwd)'
+}
+
+launcher_ids() {
+  launcher_sessions | jq -r '.id // empty'
+}
+
+live_pids() {
+  local pid
+  launcher_sessions | jq -r '.pid // empty' | while IFS= read -r pid; do
+    kill -0 "$pid" 2>/dev/null && printf '%s\n' "$pid"
+  done
+}
+
+agent_loaded() {
+  launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1
+}
+
+# True when this script runs inside the launcher session, for example after "stop" from the phone.
+inside_launcher() {
+  local pids pid
+  pids=" $(live_pids | tr '\n' ' ') "
+  pid=$$
+  while [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
+    case "$pids" in *" $pid "*) return 0 ;; esac
+    pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+  done
+  return 1
+}
+
+rc_link() {
+  local id="$1"
+  claude logs "$id" 2>/dev/null | grep -oE 'RC=session_[A-Za-z0-9]+' | tail -1 | sed 's|^RC=|https://claude.ai/code/|'
+}
+
+write_plist() {
+  mkdir -p "$(dirname "$PLIST")"
+  cat >"$PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$SELF</string>
+    <string>ensure</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>$CHECK_INTERVAL_SECONDS</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>$LOG</string>
+  <key>StandardErrorPath</key>
+  <string>$LOG</string>
+</dict>
+</plist>
+PLIST
+}
+
+start_session() {
+  if [ -n "$(live_pids)" ]; then
+    log "Launcher session already runs."
+    return 0
+  fi
+
+  local out id waited=0 link=""
+  out="$(cd "$DIR" && claude --bg \
+    --name "$NAME" \
+    --remote-control "$NAME" \
+    --setting-sources project,local \
+    --strict-mcp-config \
+    --permission-mode dontAsk \
+    "Run this exact command and reply with only its output: $SELF whoami" 2>&1)"
+  id="$(printf '%s' "$out" | grep -oE 'backgrounded · [0-9a-f]+' | awk '{print $3}')"
+  if [ -z "$id" ]; then
+    log "Launcher session did not start:"
+    log "$out"
+    return 1
+  fi
+
+  while [ "$waited" -lt "$START_WAIT_SECONDS" ]; do
+    sleep 3
+    waited=$((waited + 3))
+    link="$(rc_link "$id")"
+    [ -n "$link" ] && break
+  done
+
+  if [ -z "$link" ] || [ "$link" = "https://claude.ai/code/none" ]; then
+    log "Launcher session $id started, but Remote Control did not connect in ${START_WAIT_SECONDS}s."
+    return 1
+  fi
+  log "Launcher session $id started: $link"
+}
+
+# Remove launcher rows whose process is gone, so restarts do not fill agent view.
+remove_stopped_rows() {
+  local line id pid
+  while IFS= read -r line; do
+    id="$(printf '%s' "$line" | jq -r '.id // empty')"
+    pid="$(printf '%s' "$line" | jq -r '.pid // empty')"
+    [ -n "$id" ] || continue
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+      claude rm "$id" >/dev/null 2>&1
+    fi
+  done < <(launcher_sessions --all)
+}
+
+# Stop gracefully, then kill whatever is left. Prints the result and returns 1 if anything survives.
+stop_session() {
+  local id pid waited=0
+
+  for id in $(launcher_ids); do
+    claude stop "$id" >/dev/null 2>&1 && log "Asked session $id to stop."
+  done
+
+  while [ -n "$(live_pids)" ] && [ "$waited" -lt "$STOP_WAIT_SECONDS" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  if [ -n "$(live_pids)" ]; then
+    log "Session did not stop in ${STOP_WAIT_SECONDS}s. Hard stop."
+    for pid in $(live_pids); do
+      kill -TERM "$pid" 2>/dev/null && log "Sent TERM to $pid."
+    done
+    sleep 3
+    for pid in $(live_pids); do
+      kill -KILL "$pid" 2>/dev/null && log "Sent KILL to $pid."
+    done
+    sleep 1
+  fi
+
+  if [ -n "$(live_pids)" ]; then
+    log "FAILED: launcher process still runs: $(live_pids | tr '\n' ' ')"
+    return 1
+  fi
+
+  remove_stopped_rows
+  log "Launcher session stopped."
+}
+
+cmd_start() {
+  mkdir -p "$DIR"
+  start_session || return 1
+  write_plist
+  # Reload, so a changed schedule takes effect.
+  if agent_loaded; then
+    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null
+  fi
+  launchctl bootstrap "$DOMAIN" "$PLIST" && log "5-minute check on."
+}
+
+cmd_stop() {
+  if agent_loaded; then
+    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null
+  fi
+  if agent_loaded; then
+    log "FAILED: the 5-minute check is still loaded."
+    return 1
+  fi
+  log "5-minute check off."
+
+  if inside_launcher; then
+    # The stop would end this shell with the session, so finish it in a detached process.
+    perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' "$SELF" _stop-session >>"$LOG" 2>&1 </dev/null &
+    disown
+    log "Stopping the launcher session now. On the Mac, cc-launcher status shows the result."
+    return 0
+  fi
+  stop_session
+}
+
+cmd_restart() {
+  local busy
+  busy="$(launcher_sessions | jq -r 'select(.status != null and .status != "idle") | .id' | head -1)"
+  if [ -n "$busy" ]; then
+    log "Restart skipped: session $busy is busy."
+    return 0
+  fi
+  stop_session && start_session
+}
+
+cmd_ensure() {
+  if [ -z "$(live_pids)" ]; then
+    log "Launcher session is gone. Starting it again."
+    remove_stopped_rows
+    start_session
+    return
+  fi
+
+  local started_ms age
+  started_ms="$(launcher_sessions | jq -r '.startedAt // 0' | sort -n | tail -1)"
+  age=$(( $(date +%s) - started_ms / 1000 ))
+  if [ "$age" -ge "$MAX_AGE_SECONDS" ]; then
+    cmd_restart
+  fi
+}
+
+cmd_status() {
+  if agent_loaded; then
+    printf '5-minute check: on\n'
+  else
+    printf '5-minute check: off\n'
+  fi
+
+  local found=0 line id pid status link
+  while IFS= read -r line; do
+    id="$(printf '%s' "$line" | jq -r '.id')"
+    pid="$(printf '%s' "$line" | jq -r '.pid // empty')"
+    status="$(printf '%s' "$line" | jq -r '.status // .state // "unknown"')"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      found=1
+      link="$(rc_link "$id")"
+      printf 'Session: %s (pid %s, %s)\nRemote Control: %s\n' "$id" "$pid" "$status" "${link:-not connected}"
+    fi
+  done < <(launcher_sessions)
+  [ "$found" -eq 1 ] || printf 'Session: not running\n'
+}
+
+case "${1:-}" in
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  restart) cmd_restart ;;
+  ensure) cmd_ensure ;;
+  status) cmd_status ;;
+  whoami) printf 'RC=%s\n' "${CLAUDE_CODE_BRIDGE_SESSION_ID:-none}" ;;
+  _stop-session) stop_session ;;
+  *)
+    printf 'Usage: cc-launcher start | stop | status | ensure | restart\n' >&2
+    exit 2
+    ;;
+esac

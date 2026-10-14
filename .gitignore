@@ -1,0 +1,5 @@
+# Runtime files never belong in the repo.
+launcher.log
+*.log
+config
+.DS_Store

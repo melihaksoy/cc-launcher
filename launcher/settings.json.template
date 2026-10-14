@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash({{BIN_DIR}}/cc-tab *)",
+      "Bash({{BIN_DIR}}/cc-launcher status)",
+      "Bash({{BIN_DIR}}/cc-launcher whoami)",
+      "Bash({{BIN_DIR}}/cc-launcher stop)"
+    ],
+    "deny": [
+      "WebFetch",
+      "WebSearch",
+      "Bash(security *)",
+      "Bash({{BIN_DIR}}/cc-totp *)",
+      "Read(/{{STATE_DIR}}/**)",
+      "Read(/{{BIN_DIR}}/**)",
+      "Read(/{{CONFIG_DIR}}/**)"
+    ],
+    "defaultMode": "dontAsk"
+  },
+  "claudeMdExcludes": [
+    "{{HOME}}/.claude/CLAUDE.md"
+  ],
+  "disableClaudeAiConnectors": true,
+  "disableBundledSkills": true,
+  "skillOverrides": {
+    "plugin-authoring": "off"
+  },
+  "disableSkillShellExecution": true,
+  "autoMemoryEnabled": false,
+  "promptSuggestionEnabled": false
+}

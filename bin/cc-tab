@@ -1,0 +1,175 @@
+#!/bin/bash
+# cc-tab: open an iTerm2 tab in a trusted project and start Claude Code with Remote Control.
+#
+#   cc-tab --code <code> --list                    list the projects it can open
+#   cc-tab --code <code> <project> [session name]  open a tab and print the session link
+#
+# Every call needs a valid one-time code from the authenticator app (see cc-totp).
+# Only folders under PROJECTS_ROOT that Claude Code already trusts are accepted.
+# The project argument is matched against folder names; it never reaches the shell as-is.
+#
+# Settings come from ~/.config/cc-launcher/config only, never from environment variables:
+# the launcher session could put variables in front of an allowed command.
+
+set -euo pipefail
+
+CONFIG="$HOME/.config/cc-launcher/config"
+
+config_get() {
+  local key="$1" default="$2" line="" value=""
+  if [ -f "$CONFIG" ]; then
+    line="$(grep -E "^${key}=" "$CONFIG" | tail -1 || true)"
+    value="${line#*=}"
+  fi
+  value="${value/#\~/$HOME}"
+  printf '%s' "${value:-$default}"
+}
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(config_get PROJECTS_ROOT "")"
+CLAUDE_BIN_DIR="$(config_get CLAUDE_BIN_DIR "$HOME/.local/bin")"
+CLAUDE_JSON="$HOME/.claude.json"
+WAIT_SECONDS=60
+
+export PATH="$CLAUDE_BIN_DIR:/usr/bin:/bin:/usr/sbin:/sbin"
+
+die() {
+  local code="$1"
+  shift
+  printf '%s\n' "$*" >&2
+  exit "$code"
+}
+
+# Claude Code records trusted folders in ~/.claude.json. This format is internal and can change.
+trusted_projects() {
+  jq -r --arg root "$ROOT/" '
+    .projects // {} | to_entries[]
+    | select(.value.hasTrustDialogAccepted == true)
+    | .key
+    | select(startswith($root))
+    | select(contains("/.") | not)
+  ' "$CLAUDE_JSON" | while IFS= read -r dir; do
+    [ -d "$dir" ] && printf '%s\n' "$dir"
+  done | sort -u
+}
+
+normalize() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9'
+}
+
+print_list() {
+  trusted_projects | sed "s|^$ROOT/||"
+}
+
+find_project() {
+  local query
+  query="$(normalize "$1")"
+  [ -n "$query" ] || die 2 "Empty project name."
+
+  local exact=() partial=() dir base
+  while IFS= read -r dir; do
+    base="$(normalize "$(basename "$dir")")"
+    if [ "$base" = "$query" ]; then
+      exact+=("$dir")
+    elif [[ "$base" == *"$query"* ]]; then
+      partial+=("$dir")
+    fi
+  done < <(trusted_projects)
+
+  local matches=()
+  if [ "${#exact[@]}" -gt 0 ]; then
+    matches=("${exact[@]}")
+  elif [ "${#partial[@]}" -gt 0 ]; then
+    matches=("${partial[@]}")
+  fi
+
+  case "${#matches[@]}" in
+    1) printf '%s\n' "${matches[0]}" ;;
+    0) die 2 "No trusted project matches '$1'. Trusted projects:
+$(print_list)" ;;
+    *) die 2 "Several projects match '$1':
+$(printf '%s\n' "${matches[@]}" | sed "s|^$ROOT/||")" ;;
+  esac
+}
+
+sanitize_name() {
+  printf '%s' "$1" | tr -cd 'A-Za-z0-9 ._-' | cut -c1-60
+}
+
+open_tab() {
+  osascript - "$1" <<'APPLESCRIPT'
+on run argv
+  tell application "iTerm"
+    if (count of windows) = 0 then
+      set w to (create window with default profile)
+    else
+      set w to current window
+      tell w to create tab with default profile
+    end if
+    set s to current session of w
+    tell s to write text (item 1 of argv)
+    return id of s
+  end tell
+end run
+APPLESCRIPT
+}
+
+read_tab() {
+  osascript - "$1" <<'APPLESCRIPT'
+on run argv
+  tell application "iTerm"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (id of s) is (item 1 of argv) then return contents of s
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return ""
+end run
+APPLESCRIPT
+}
+
+main() {
+  local usage="Usage: cc-tab --code <code> --list | cc-tab --code <code> <project> [session name]"
+  [ "$#" -ge 3 ] && [ "$1" = "--code" ] || die 2 "$usage"
+
+  [ -n "$ROOT" ] && [ -d "$ROOT" ] || die 2 "PROJECTS_ROOT is not set in $CONFIG. Run install.sh --projects-root DIR."
+
+  "$BIN_DIR/cc-totp" verify "$2" || exit 5
+  shift 2
+
+  if [ "$1" = "--list" ]; then
+    print_list
+    return 0
+  fi
+
+  local dir name cmd tab_id contents="" url
+  dir="$(find_project "$1")"
+  name="$(sanitize_name "${2:-}")"
+  [ -n "$name" ] || name="$(basename "$dir")"
+
+  cmd="cd $(printf '%q' "$dir") && claude --remote-control $(printf '%q' "$name")"
+  tab_id="$(open_tab "$cmd")"
+
+  local waited=0
+  while [ "$waited" -lt "$WAIT_SECONDS" ]; do
+    sleep 2
+    waited=$((waited + 2))
+    contents="$(read_tab "$tab_id")"
+    url="$(printf '%s' "$contents" | grep -oE 'https://claude\.ai/code/session_[A-Za-z0-9]+' | head -1 || true)"
+    if [ -n "$url" ]; then
+      printf 'Opened %s as "%s"\n%s\n' "${dir#"$ROOT"/}" "$name" "$url"
+      return 0
+    fi
+    if printf '%s' "$contents" | grep -qiE 'trust this folder|Enable Remote Control\?'; then
+      die 3 "The tab for ${dir#"$ROOT"/} waits for an answer on the Mac (trust or Remote Control confirmation)."
+    fi
+  done
+
+  die 4 "The tab for ${dir#"$ROOT"/} opened, but no session link appeared in ${WAIT_SECONDS}s. Last lines:
+$(printf '%s' "$contents" | grep -v '^[[:space:]]*$' | tail -5)"
+}
+
+main "$@"

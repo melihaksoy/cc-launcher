@@ -1,0 +1,191 @@
+#!/bin/bash
+# cc-totp: one-time codes (TOTP, RFC 6238: SHA-1, 6 digits, 30 s) that gate cc-tab.
+#
+#   cc-totp setup [--reset]  make a secret, keep it in the Keychain, print the key for the authenticator app
+#   cc-totp verify <code>    exit 0 for a valid, unused code; exit 1 otherwise
+#   cc-totp unlock           clear the lockout after too many wrong codes (run on the Mac)
+#
+# Wrong codes: 5 in 15 minutes block codes for 15 minutes; 15 in 24 hours block them until unlock.
+#
+# The secret lives only in the login Keychain. Run setup in a terminal on the Mac, never through
+# Claude: its output would go into the session transcript.
+
+set -uo pipefail
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+
+CONFIG="$HOME/.config/cc-launcher/config"
+
+config_get() {
+  local key="$1" default="$2" line="" value=""
+  if [ -f "$CONFIG" ]; then
+    line="$(grep -E "^${key}=" "$CONFIG" | tail -1 || true)"
+    value="${line#*=}"
+  fi
+  value="${value/#\~/$HOME}"
+  printf '%s' "${value:-$default}"
+}
+
+SERVICE="$(config_get KEYCHAIN_SERVICE "cc-launcher-totp")"
+ACCOUNT="$USER"
+STATE_DIR="$(config_get STATE_DIR "$HOME/.local/state/cc-launcher")"
+LAST_STEP_FILE="$STATE_DIR/last-step"
+FAILS_FILE="$STATE_DIR/fails"
+LOCKOUT_FILE="$STATE_DIR/locked"
+LOCK_DIR="$STATE_DIR/lock"
+MAX_FAILS=5
+FAIL_WINDOW_SECONDS=900
+MAX_DAILY_FAILS=15
+DAY_SECONDS=86400
+DRIFT_STEPS=1
+
+read_secret() {
+  security find-generic-password -a "$ACCOUNT" -s "$SERVICE" -w 2>/dev/null
+}
+
+# Prints the 6-digit code for one 30 s step. The secret comes in through the environment, not argv.
+code_for_step() {
+  CC_TOTP_SECRET="$1" perl -MDigest::SHA=hmac_sha1 -e '
+    my $step = $ARGV[0];
+    my @alphabet = ("A".."Z", "2".."7");
+    my %value;
+    @value{@alphabet} = 0..31;
+    (my $b32 = uc $ENV{CC_TOTP_SECRET}) =~ s/[^A-Z2-7]//g;
+    my $bits = join "", map { sprintf "%05b", $value{$_} } split //, $b32;
+    my $key = pack "B*", substr($bits, 0, int(length($bits) / 8) * 8);
+    my $hash = hmac_sha1(pack("NN", int($step / 2**32), $step % 2**32), $key);
+    my $offset = ord(substr($hash, -1)) & 0x0f;
+    my $number = unpack("N", substr($hash, $offset, 4)) & 0x7fffffff;
+    printf "%06d\n", $number % 1000000;
+  ' "$2"
+}
+
+# Number of wrong codes in the last $1 seconds.
+recent_fails() {
+  local cutoff
+  cutoff=$(( $(date +%s) - $1 ))
+  [ -f "$FAILS_FILE" ] || { echo 0; return; }
+  awk -v cutoff="$cutoff" '$1 >= cutoff' "$FAILS_FILE" | wc -l | tr -d ' '
+}
+
+record_fail() {
+  date +%s >>"$FAILS_FILE"
+  # Keep one day of history.
+  local cutoff tmp
+  cutoff=$(( $(date +%s) - DAY_SECONDS ))
+  tmp="$(mktemp "$STATE_DIR/fails.XXXXXX")"
+  awk -v cutoff="$cutoff" '$1 >= cutoff' "$FAILS_FILE" >"$tmp" && mv "$tmp" "$FAILS_FILE"
+  if [ "$(recent_fails "$DAY_SECONDS")" -ge "$MAX_DAILY_FAILS" ]; then
+    date >"$LOCKOUT_FILE"
+  fi
+}
+
+# One verify at a time, so two calls cannot both accept the same code.
+take_lock() {
+  local tries=0
+  until mkdir "$LOCK_DIR" 2>/dev/null; do
+    # A lock older than 30 s belongs to a killed run.
+    if [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mtime +30s 2>/dev/null)" ]; then
+      rmdir "$LOCK_DIR" 2>/dev/null
+      continue
+    fi
+    tries=$((tries + 1))
+    if [ "$tries" -ge 50 ]; then
+      echo "Code check is busy. Try again." >&2
+      exit 1
+    fi
+    sleep 0.1
+  done
+  trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+}
+
+cmd_setup() {
+  if read_secret >/dev/null && [ "${1:-}" != "--reset" ]; then
+    echo "A secret already exists. Run 'cc-totp setup --reset' to replace it." >&2
+    exit 1
+  fi
+
+  local secret
+  secret="$(head -c 20 /dev/urandom | perl -e '
+    local $/;
+    my $bits = unpack "B*", <STDIN>;
+    my @alphabet = ("A".."Z", "2".."7");
+    print join "", map { $alphabet[oct "0b$_"] } $bits =~ /(.{5})/g;
+  ')"
+  security add-generic-password -U -a "$ACCOUNT" -s "$SERVICE" -l "cc-launcher one-time codes" -w "$secret" || exit 1
+
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
+  rm -f "$LAST_STEP_FILE" "$FAILS_FILE" "$LOCKOUT_FILE"
+
+  cat <<EOF
+
+Add this key to your authenticator app.
+Choose "enter a setup key", type: time based, 6 digits, 30 seconds.
+
+  Account: cc-launcher
+  Key:     $(printf '%s' "$secret" | sed -E 's/(.{4})/\1 /g')
+
+Then check it: the code the app shows now must be accepted by
+  cc-totp verify <code>
+
+Close this terminal when you are done, so the key does not stay on screen.
+EOF
+}
+
+cmd_verify() {
+  local code="${1:-}"
+  if ! [[ "$code" =~ ^[0-9]{6}$ ]]; then
+    echo "The code must be 6 digits." >&2
+    exit 1
+  fi
+
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
+  take_lock
+
+  if [ -f "$LOCKOUT_FILE" ]; then
+    echo "Codes are locked after too many wrong codes. Run 'cc-totp unlock' on the Mac." >&2
+    exit 1
+  fi
+  if [ "$(recent_fails "$FAIL_WINDOW_SECONDS")" -ge "$MAX_FAILS" ]; then
+    echo "Too many wrong codes. Wait 15 minutes." >&2
+    exit 1
+  fi
+
+  local secret
+  secret="$(read_secret)" || { echo "No secret. Run 'cc-totp setup' on the Mac first." >&2; exit 1; }
+
+  local now_step last_step=0 step delta
+  now_step=$(( $(date +%s) / 30 ))
+  [ -f "$LAST_STEP_FILE" ] && last_step="$(cat "$LAST_STEP_FILE")"
+
+  for delta in $(seq "-$DRIFT_STEPS" "$DRIFT_STEPS"); do
+    step=$((now_step + delta))
+    if [ "$(code_for_step "$secret" "$step")" = "$code" ]; then
+      if [ "$step" -le "$last_step" ]; then
+        record_fail
+        echo "This code was already used. Wait for the next one." >&2
+        exit 1
+      fi
+      printf '%s\n' "$step" >"$LAST_STEP_FILE"
+      return 0
+    fi
+  done
+
+  record_fail
+  echo "Wrong code." >&2
+  exit 1
+}
+
+case "${1:-}" in
+  setup) cmd_setup "${2:-}" ;;
+  verify) cmd_verify "${2:-}" ;;
+  unlock)
+    rm -f "$LOCKOUT_FILE" "$FAILS_FILE"
+    echo "Code check unlocked."
+    ;;
+  *)
+    echo "Usage: cc-totp setup [--reset] | cc-totp verify <code> | cc-totp unlock" >&2
+    exit 2
+    ;;
+esac
