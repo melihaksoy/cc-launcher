@@ -90,7 +90,9 @@ The launcher stays off after `stop` until you run `cc-launcher start`.
   with `--remote-control`, `--setting-sources project,local`, `--strict-mcp-config` and
   `--permission-mode dontAsk`. A LaunchAgent runs `cc-launcher ensure` every 5 minutes: it starts
   the session again when the background service retired it (this happens to idle sessions under
-  memory pressure), and it restarts a session older than an hour while it is idle.
+  memory pressure). It restarts a running session only when it is idle and its context is over
+  100k tokens (`CONTEXT_LIMIT_TOKENS`). The stop archives the old Remote Control session, so the
+  Claude app keeps one "Launcher" row. Run `cc-launcher restart` for a clean context at any time.
 - `launcher/` holds the launcher's `CLAUDE.md` and settings. The settings allow only the `cc-tab`
   and `cc-launcher status|stop|whoami` commands and deny web tools, the Keychain tool and reads of
   the scripts, the config and the code state.

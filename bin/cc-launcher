@@ -3,13 +3,14 @@
 # that opens iTerm2 tabs with cc-tab.
 #
 # A LaunchAgent runs `ensure` every 5 minutes. The background service can retire an idle
-# session (for example under memory pressure), so `ensure` starts it again, and it restarts a
-# session older than an hour while idle, for a clean context.
+# session (for example under memory pressure), so `ensure` starts it again. It restarts a
+# running session only when it is idle and its context is over CONTEXT_LIMIT_TOKENS. Only
+# messages grow the context, so an unused session never restarts.
 #
 #   cc-launcher start    start the session and the 5-minute check
 #   cc-launcher stop     remove the check, stop the session, kill it if it does not stop
-#   cc-launcher status   show the check, the session and its Remote Control link
-#   cc-launcher ensure   start the session if it is gone; restart it if old and idle (LaunchAgent)
+#   cc-launcher status   show the check, the session, its context and its Remote Control link
+#   cc-launcher ensure   start the session if it is gone; restart it if its context is full (LaunchAgent)
 #   cc-launcher restart  stop and start the session only
 #   cc-launcher whoami   print the Remote Control session id (run by the launcher session itself)
 
@@ -39,7 +40,7 @@ DOMAIN="gui/$(id -u)"
 STOP_WAIT_SECONDS=15
 START_WAIT_SECONDS=60
 CHECK_INTERVAL_SECONDS=300
-MAX_AGE_SECONDS=3600
+CONTEXT_LIMIT_TOKENS=100000
 
 export PATH="$CLAUDE_BIN_DIR:/usr/bin:/bin:/usr/sbin:/sbin"
 
@@ -80,6 +81,20 @@ inside_launcher() {
     pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
   done
   return 1
+}
+
+# Context size of a session in tokens: the usage of its last model reply, from its transcript.
+context_tokens() {
+  local session_id="$1" transcript
+  transcript="$HOME/.claude/projects/$(printf '%s' "$DIR" | sed 's/[^A-Za-z0-9]/-/g')/$session_id.jsonl"
+  if [ ! -f "$transcript" ]; then
+    printf '0'
+    return
+  fi
+  jq -s '[.[] | select(.type == "assistant") | .message.usage // empty] | last
+    | if . == null then 0
+      else (.input_tokens // 0) + (.cache_creation_input_tokens // 0) + (.cache_read_input_tokens // 0)
+      end' "$transcript" 2>/dev/null || printf '0'
 }
 
 rc_link() {
@@ -245,10 +260,12 @@ cmd_ensure() {
     return
   fi
 
-  local started_ms age
-  started_ms="$(launcher_sessions | jq -r '.startedAt // 0' | sort -n | tail -1)"
-  age=$(( $(date +%s) - started_ms / 1000 ))
-  if [ "$age" -ge "$MAX_AGE_SECONDS" ]; then
+  local session_id tokens
+  session_id="$(launcher_sessions | jq -r '.sessionId // empty' | tail -1)"
+  [ -n "$session_id" ] || return 0
+  tokens="$(context_tokens "$session_id")"
+  if [ "$tokens" -ge "$CONTEXT_LIMIT_TOKENS" ]; then
+    log "Context is $tokens tokens, over the $CONTEXT_LIMIT_TOKENS limit. Restarting."
     cmd_restart
   fi
 }
@@ -260,7 +277,7 @@ cmd_status() {
     printf '5-minute check: off\n'
   fi
 
-  local found=0 line id pid status link
+  local found=0 line id pid status link tokens
   while IFS= read -r line; do
     id="$(printf '%s' "$line" | jq -r '.id')"
     pid="$(printf '%s' "$line" | jq -r '.pid // empty')"
@@ -268,7 +285,9 @@ cmd_status() {
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       found=1
       link="$(rc_link "$id")"
-      printf 'Session: %s (pid %s, %s)\nRemote Control: %s\n' "$id" "$pid" "$status" "${link:-not connected}"
+      tokens="$(context_tokens "$(printf '%s' "$line" | jq -r '.sessionId // empty')")"
+      printf 'Session: %s (pid %s, %s)\nContext: %s of %s tokens\nRemote Control: %s\n' \
+        "$id" "$pid" "$status" "$tokens" "$CONTEXT_LIMIT_TOKENS" "${link:-not connected}"
     fi
   done < <(launcher_sessions)
   [ "$found" -eq 1 ] || printf 'Session: not running\n'
