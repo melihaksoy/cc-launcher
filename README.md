@@ -88,11 +88,14 @@ The launcher stays off after `stop` until you run `cc-launcher start`.
 
 - `bin/cc-launcher` starts a Claude Code background session (`claude --bg`) in the launcher folder,
   with `--remote-control`, `--setting-sources project,local`, `--strict-mcp-config` and
-  `--permission-mode dontAsk`. A LaunchAgent runs `cc-launcher ensure` every 5 minutes: it starts
-  the session again when the background service retired it (this happens to idle sessions under
-  memory pressure). It restarts a running session only when it is idle and its context is over
-  100k tokens (`CONTEXT_LIMIT_TOKENS`). The stop archives the old Remote Control session, so the
-  Claude app keeps one "Launcher" row. Run `cc-launcher restart` for a clean context at any time.
+  `--permission-mode dontAsk`. The background service retires idle sessions (after 8 hours with
+  Remote Control, sooner under memory pressure), and each new session adds a "Launcher" row to the
+  Claude app. The session therefore creates a one-shot cron job for a year ahead: the service does
+  not retire a session with a pending job. `cc-launcher status` shows it as `Keepalive: on`.
+  A LaunchAgent runs `cc-launcher ensure` every 5 minutes: it starts the session again when it is
+  gone and the API is reachable. It restarts a running session only when it is idle and its context
+  is over 100k tokens (`CONTEXT_LIMIT_TOKENS`). The stop archives the old Remote Control session, so
+  the Claude app keeps one "Launcher" row. Run `cc-launcher restart` for a clean context at any time.
 - `launcher/` holds the launcher's `CLAUDE.md` and settings. The settings allow only the `cc-tab`
   and `cc-launcher status|stop|whoami` commands and deny web tools, the Keychain tool and reads of
   the scripts, the config and the code state.

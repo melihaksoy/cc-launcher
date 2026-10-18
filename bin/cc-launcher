@@ -2,15 +2,19 @@
 # cc-launcher: a hidden Claude Code background session, reachable through Remote Control,
 # that opens iTerm2 tabs with cc-tab.
 #
-# A LaunchAgent runs `ensure` every 5 minutes. The background service can retire an idle
-# session (for example under memory pressure), so `ensure` starts it again. It restarts a
-# running session only when it is idle and its context is over CONTEXT_LIMIT_TOKENS. Only
-# messages grow the context, so an unused session never restarts.
+# The background service retires an idle session (after 8 hours with Remote Control, sooner
+# under memory pressure), and every new session adds a row to the Claude app. The session
+# therefore schedules a one-shot cron job a year ahead: the service does not retire a session
+# with a pending job.
+#
+# A LaunchAgent runs `ensure` every 5 minutes. It starts the session again if it is gone and
+# the API is reachable. It restarts a running session only when it is idle and its context is
+# over CONTEXT_LIMIT_TOKENS. Only messages grow the context, so an unused session never restarts.
 #
 #   cc-launcher start    start the session and the 5-minute check
 #   cc-launcher stop     remove the check, stop the session, kill it if it does not stop
-#   cc-launcher status   show the check, the session, its context and its Remote Control link
-#   cc-launcher ensure   start the session if it is gone; restart it if its context is full (LaunchAgent)
+#   cc-launcher status   show the check, the session, its context, its keepalive and its Remote Control link
+#   cc-launcher ensure   start the session if it is gone and online; restart it if its context is full (LaunchAgent)
 #   cc-launcher restart  stop and start the session only
 #   cc-launcher whoami   print the Remote Control session id (run by the launcher session itself)
 
@@ -97,6 +101,18 @@ context_tokens() {
       end' "$transcript" 2>/dev/null || printf '0'
 }
 
+# True when the session has a pending cron job, which stops the background service from retiring it.
+keepalive_on() {
+  local id="$1"
+  jq -e '.inFlight.kinds | index("session_cron")' "$HOME/.claude/jobs/$id/state.json" >/dev/null 2>&1
+}
+
+# Any HTTP reply counts. Without this check, an offline Mac starts a session that fails and is
+# retired after an hour, again and again.
+api_reachable() {
+  curl -s -o /dev/null --max-time 10 https://api.anthropic.com
+}
+
 rc_link() {
   local id="$1"
   claude logs "$id" 2>/dev/null | grep -oE 'RC=session_[A-Za-z0-9]+' | tail -1 | sed 's|^RC=|https://claude.ai/code/|'
@@ -135,14 +151,17 @@ start_session() {
     return 0
   fi
 
-  local out id waited=0 link=""
+  local out id waited=0 link="" keepalive_cron
+  # Yesterday's date, so the next match is about a year away.
+  keepalive_cron="7 3 $(date -v-1d '+%-d %-m') *"
   out="$(cd "$DIR" && claude --bg \
     --name "$NAME" \
     --remote-control "$NAME" \
     --setting-sources project,local \
     --strict-mcp-config \
     --permission-mode dontAsk \
-    "Run this exact command and reply with only its output: $SELF whoami" 2>&1)"
+    "Run this exact command: $SELF whoami. Then call CronCreate with cron \"$keepalive_cron\", \
+recurring false and prompt \"Reply with OK only.\" (the keepalive job). Reply with only the command output." 2>&1)"
   id="$(printf '%s' "$out" | grep -oE 'backgrounded · [0-9a-f]+' | awk '{print $3}')"
   if [ -z "$id" ]; then
     log "Launcher session did not start:"
@@ -153,8 +172,8 @@ start_session() {
   while [ "$waited" -lt "$START_WAIT_SECONDS" ]; do
     sleep 3
     waited=$((waited + 3))
-    link="$(rc_link "$id")"
-    [ -n "$link" ] && break
+    [ -n "$link" ] || link="$(rc_link "$id")"
+    [ -n "$link" ] && keepalive_on "$id" && break
   done
 
   if [ -z "$link" ] || [ "$link" = "https://claude.ai/code/none" ]; then
@@ -162,6 +181,7 @@ start_session() {
     return 1
   fi
   log "Launcher session $id started: $link"
+  keepalive_on "$id" || log "Session $id has no keepalive job. The background service can retire it when idle."
 }
 
 # Remove launcher rows whose process is gone, so restarts do not fill agent view.
@@ -172,7 +192,7 @@ remove_stopped_rows() {
     pid="$(printf '%s' "$line" | jq -r '.pid // empty')"
     [ -n "$id" ] || continue
     if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
-      claude rm "$id" >/dev/null 2>&1
+      claude rm "$id" >/dev/null 2>&1 || log "Could not remove stopped session $id."
     fi
   done < <(launcher_sessions --all)
 }
@@ -254,6 +274,12 @@ cmd_restart() {
 
 cmd_ensure() {
   if [ -z "$(live_pids)" ]; then
+    if ! api_reachable; then
+      local offline="Launcher session is gone, but the API is not reachable. Waiting for the network."
+      # Log once per offline period, not every 5 minutes.
+      tail -1 "$LOG" 2>/dev/null | grep -qF "$offline" || log "$offline"
+      return 0
+    fi
     log "Launcher session is gone. Starting it again."
     remove_stopped_rows
     start_session
@@ -277,7 +303,7 @@ cmd_status() {
     printf '5-minute check: off\n'
   fi
 
-  local found=0 line id pid status link tokens
+  local found=0 line id pid status link tokens keepalive
   while IFS= read -r line; do
     id="$(printf '%s' "$line" | jq -r '.id')"
     pid="$(printf '%s' "$line" | jq -r '.pid // empty')"
@@ -286,8 +312,9 @@ cmd_status() {
       found=1
       link="$(rc_link "$id")"
       tokens="$(context_tokens "$(printf '%s' "$line" | jq -r '.sessionId // empty')")"
-      printf 'Session: %s (pid %s, %s)\nContext: %s of %s tokens\nRemote Control: %s\n' \
-        "$id" "$pid" "$status" "$tokens" "$CONTEXT_LIMIT_TOKENS" "${link:-not connected}"
+      if keepalive_on "$id"; then keepalive="on"; else keepalive="off"; fi
+      printf 'Session: %s (pid %s, %s)\nContext: %s of %s tokens\nKeepalive: %s\nRemote Control: %s\n' \
+        "$id" "$pid" "$status" "$tokens" "$CONTEXT_LIMIT_TOKENS" "$keepalive" "${link:-not connected}"
     fi
   done < <(launcher_sessions)
   [ "$found" -eq 1 ] || printf 'Session: not running\n'

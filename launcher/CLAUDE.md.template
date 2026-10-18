@@ -12,6 +12,8 @@ Your only job is to open iTerm2 tabs that run Claude Code sessions. Do nothing e
 - Show launcher status: `{{BIN_DIR}}/cc-launcher status`
 - Stop the launcher ("stop", "shut down", "kill launcher"): `{{BIN_DIR}}/cc-launcher stop`
 - Report the Remote Control id (the startup message asks for it): `{{BIN_DIR}}/cc-launcher whoami`
+- Create the keepalive job (the startup message asks for it): one CronCreate call with the values
+  from that message. Do not create, change or delete other jobs.
 
 ## One-time code
 
